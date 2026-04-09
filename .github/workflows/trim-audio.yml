@@ -1,0 +1,248 @@
+name: Trim Audio + SRT + Final Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      mp3_url:
+        description: "Source MP3 URL"
+        required: true
+        type: string
+      image_url:
+        description: "Final image URL"
+        required: true
+        type: string
+      output_name:
+        description: "Base output filename"
+        required: true
+        type: string
+      job_key:
+        description: "Unique row/job key"
+        required: true
+        type: string
+
+concurrency:
+  group: trim-audio-single-queue
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    container:
+      image: ghcr.io/anthonykingkruger/ffmpeg-whisper:latest
+
+    steps:
+      - name: Show inputs
+        run: |
+          echo "MP3 URL: ${{ github.event.inputs.mp3_url }}"
+          echo "IMAGE URL: ${{ github.event.inputs.image_url }}"
+          echo "Output Name: ${{ github.event.inputs.output_name }}"
+          echo "Job Key: ${{ github.event.inputs.job_key }}"
+
+      - name: Download MP3
+        run: |
+          set -e
+          curl -L --retry 3 --retry-delay 3 -A "Mozilla/5.0" -o input.mp3 "${{ github.event.inputs.mp3_url }}"
+          ls -lh input.mp3
+
+      - name: Download Image
+        run: |
+          set -e
+          curl -L --retry 3 --retry-delay 3 -A "Mozilla/5.0" -o input_image "${{ github.event.inputs.image_url }}"
+          ls -lh input_image
+
+      - name: Validate MP3 with ffprobe
+        run: |
+          set -e
+          ffprobe -v error -show_streams input.mp3 > mp3_probe.txt 2>&1 || true
+          cat mp3_probe.txt || true
+
+          if ! grep -qi "codec_type=audio" mp3_probe.txt; then
+            echo "Invalid MP3 file"
+            exit 1
+          fi
+
+      - name: Normalize Image
+        run: |
+          set -e
+
+          if ffprobe -v error input_image >/dev/null 2>&1; then
+            ffmpeg -y -i input_image -frames:v 1 bg.jpg
+          else
+            cp input_image bg.jpg
+          fi
+
+          test -f bg.jpg
+          ls -lh bg.jpg
+
+      - name: Trim Audio (remove first 5.5 sec)
+        run: |
+          set -e
+          ffmpeg -y -ss 00:00:05.5 -i input.mp3 -vn -acodec libmp3lame -q:a 2 output.mp3
+          test -f output.mp3
+          ls -lh output.mp3
+
+      - name: Generate SRT + TXT + VTT + JSON (Whisper)
+        run: |
+          set -e
+          whisper output.mp3 \
+            --model base \
+            --task transcribe \
+            --language en \
+            --output_format all \
+            --output_dir .
+
+      - name: Rename Outputs
+        run: |
+          set -e
+          [ -f output.srt ] && mv output.srt transcript_raw.srt || true
+          [ -f output.txt ] && mv output.txt transcript.txt || true
+          [ -f output.vtt ] && mv output.vtt transcript.vtt || true
+          [ -f output.json ] && mv output.json transcript.json || true
+
+          if [ ! -f transcript_raw.srt ]; then
+            echo "transcript_raw.srt not found"
+            exit 1
+          fi
+
+          sed -i 's/\r$//' transcript_raw.srt || true
+
+      - name: Clean + Rewrap SRT
+        run: |
+          set -e
+          python3 << 'PY'
+          import re, textwrap
+          from pathlib import Path
+
+          inp = Path("transcript_raw.srt")
+          outp = Path("transcript.srt")
+
+          if not inp.exists():
+              raise SystemExit("transcript_raw.srt not found")
+
+          raw = inp.read_text(encoding="utf-8", errors="ignore").replace("\r", "")
+          blocks = re.split(r"\n\s*\n", raw.strip())
+
+          def clean_text(t):
+              t = t.replace("\n", " ").strip()
+              t = re.sub(r"\s+", " ", t)
+              t = re.sub(r"\s+([,.!?;:])", r"\1", t)
+              return t.strip()
+
+          def wrap_three_lines_card(text, width=24):
+              wrapped = textwrap.wrap(text, width=width, break_long_words=False, break_on_hyphens=False)
+              if len(wrapped) <= 3:
+                  return "\n".join(wrapped)
+              return "\n".join(wrapped[:3])
+
+          new_blocks = []
+          idx = 1
+
+          for block in blocks:
+              lines = [x for x in block.strip().split("\n") if x.strip()]
+              if len(lines) < 3:
+                  continue
+
+              time_line = lines[1].strip()
+              text = clean_text(" ".join(lines[2:]))
+
+              if not text:
+                  continue
+
+              text = wrap_three_lines_card(text, width=24)
+              new_blocks.append(f"{idx}\n{time_line}\n{text}")
+              idx += 1
+
+          outp.write_text("\n\n".join(new_blocks) + "\n", encoding="utf-8")
+          PY
+
+          test -f transcript.srt
+
+      - name: Convert to ASS
+        run: |
+          set -e
+          ffmpeg -y -i transcript.srt transcript.ass
+
+          python3 << 'PY'
+          from pathlib import Path
+
+          p = Path("transcript.ass")
+          txt = p.read_text(encoding="utf-8", errors="ignore")
+          lines = txt.splitlines()
+
+          out = []
+          style_replaced = False
+
+          for l in lines:
+              if l.startswith("PlayResX:"):
+                  out.append("PlayResX: 1920")
+              elif l.startswith("PlayResY:"):
+                  out.append("PlayResY: 1080")
+              elif l.startswith("Style: Default") and not style_replaced:
+                  out.append("Style: Default,DejaVu Sans,48,&H00FFFFFF,&H00FFFFFF,&H00000000,&H50000000,1,0,0,0,100,100,0,0,1,2,0,1,1135,135,360")
+                  style_replaced = True
+              else:
+                  out.append(l)
+
+          p.write_text("\n".join(out), encoding="utf-8")
+          PY
+
+          test -f transcript.ass
+
+      - name: Get Duration
+        id: duration
+        run: |
+          set -e
+          D=$(ffprobe -v error -show_entries format=duration -of csv=p=0 output.mp3)
+          echo "duration=$D" >> $GITHUB_OUTPUT
+          echo "Audio duration: $D"
+
+      - name: Create Final Video
+        run: |
+          set -e
+          FILTER="[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,drawbox=x=1050:y=540:w=720:h=280:color=black@0.42:t=fill,drawbox=x=1050:y=540:w=720:h=280:color=white@0.08:t=2[subbg];[subbg]ass=transcript.ass"
+
+          ffmpeg -y \
+            -loop 1 -framerate 30 -i bg.jpg \
+            -i output.mp3 \
+            -filter_complex "$FILTER" \
+            -c:v libx264 \
+            -preset medium \
+            -crf 20 \
+            -pix_fmt yuv420p \
+            -r 30 \
+            -t "${{ steps.duration.outputs.duration }}" \
+            -c:a aac \
+            -b:a 192k \
+            -shortest \
+            final_video.mp4
+
+          test -f final_video.mp4
+          ls -lh final_video.mp4
+
+      - name: Verify Outputs
+        run: |
+          set -e
+          ls -lh
+          test -f output.mp3
+          test -f transcript_raw.srt
+          test -f transcript.srt
+          test -f transcript.ass
+          test -f transcript.txt
+          test -f final_video.mp4
+
+      - name: Upload Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-${{ github.event.inputs.job_key }}
+          path: |
+            output.mp3
+            transcript_raw.srt
+            transcript.srt
+            transcript.ass
+            transcript.txt
+            transcript.vtt
+            transcript.json
+            final_video.mp4
+          if-no-files-found: warn
