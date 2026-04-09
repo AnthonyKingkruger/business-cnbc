@@ -1,4 +1,4 @@
-name: Trim Audio + SRT + Final Video
+name: CNBC BUSINESS Trim Audio + SRT + Final Video
 
 on:
   workflow_dispatch:
