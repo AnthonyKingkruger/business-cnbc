@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
 
     container:
-      image: ghcr.io/anthonykingkruger/ffmpeg-whisper:latest
+        image: ghcr.io/${{ github.repository_owner }}/business-cnbc:latest
 
     steps:
       - name: Show inputs
